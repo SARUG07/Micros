@@ -1,5 +1,5 @@
 #include "driver/gpio.h"
-#include <unistd.h>   // para usleep
+#include <unistd.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -12,11 +12,11 @@
 #define D7 16
 
 // ==== Pines del MM74C922 ====
-#define D0  25  // Bit menos significativo
+#define D0  25
 #define D1  26
 #define D2  27
-#define D3  14  // Bit más significativo
-#define DATA_AVAIL  33  // Señal de dato disponible (activo en bajo)
+#define D3  14
+#define DATA_AVAIL  33
 
 // ==== Pines motor paso a paso ====
 #define IN1 32
@@ -24,18 +24,24 @@
 #define IN3 2
 #define IN4 13
 
+// ==== Pin sensor Hall ====
+#define HALL_PIN  23
+
+// ==== Variables globales ====
 int velocidad = 0;
 int step_index = 0;
 float angulo = 0.0;
+volatile int hall_detectado = 0;
+volatile int hall_pulsos = 0;
+const int pasos_por_vuelta_motor = 4096; // 28BYJ-48 típico
+const int pasos_por_vuelta_hall = 1;     // Pulsos del hall por vuelta
 
-// ==== Funciones LCD ====
-
+// ==== LCD ====
 void lcd_send_nibble(uint8_t nibble) {
     gpio_set_level(D4, (nibble >> 0) & 1);
     gpio_set_level(D5, (nibble >> 1) & 1);
     gpio_set_level(D6, (nibble >> 2) & 1);
     gpio_set_level(D7, (nibble >> 3) & 1);
-
     gpio_set_level(E, 1);
     usleep(1);
     gpio_set_level(E, 0);
@@ -66,19 +72,18 @@ void lcd_init() {
     gpio_set_direction(D7, GPIO_MODE_OUTPUT);
 
     usleep(15000);
-
     lcd_send_nibble(0x03);
     usleep(5000);
     lcd_send_nibble(0x03);
     usleep(200);
     lcd_send_nibble(0x03);
     usleep(200);
-    lcd_send_nibble(0x02); // 4-bit mode
+    lcd_send_nibble(0x02);
 
-    lcd_cmd(0x28); // 4 bits, 2 líneas, 5x8
-    lcd_cmd(0x0C); // Display on, cursor off
-    lcd_cmd(0x06); // Incremento automático
-    lcd_cmd(0x01); // Limpiar pantalla
+    lcd_cmd(0x28);
+    lcd_cmd(0x0C);
+    lcd_cmd(0x06);
+    lcd_cmd(0x01);
     usleep(2000);
 }
 
@@ -93,8 +98,7 @@ void lcd_print(const char *s) {
     }
 }
 
-// ==== Funciones Teclado ====
-
+// ==== Teclado ====
 int leer_tecla() {
     int b0 = gpio_get_level(D0);
     int b1 = gpio_get_level(D1);
@@ -112,8 +116,7 @@ void teclado_init() {
     gpio_set_direction(DATA_AVAIL, GPIO_MODE_INPUT);
 }
 
-// ==== Funciones Motor Paso a Paso ====
-
+// ==== Motor ====
 const int motor_steps[8][4] = {
     {0, 1, 1, 1},
     {0, 0, 1, 1},
@@ -146,12 +149,31 @@ void motor_stop() {
     gpio_set_level(IN4, 0);
 }
 
-// ==== Programa Principal ====
+// ==== Sensor Hall ====
+void IRAM_ATTR hall_isr() {
+    hall_pulsos++;
+    hall_detectado = 1; // Señal para auto-calibrar
+}
 
+void hall_init() {
+    gpio_set_direction(HALL_PIN, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(HALL_PIN, GPIO_PULLUP_ONLY);
+    gpio_set_intr_type(HALL_PIN, GPIO_INTR_NEGEDGE);
+    gpio_install_isr_service(0);
+    gpio_isr_handler_add(HALL_PIN, hall_isr, NULL);
+}
+
+float hall_get_angulo() {
+    if (hall_pulsos == 0) return 0.0;
+    return (360.0 / pasos_por_vuelta_hall) * (hall_pulsos % pasos_por_vuelta_hall);
+}
+
+// ==== Programa principal ====
 void app_main() {
     lcd_init();
     teclado_init();
     motor_init();
+    hall_init();
 
     lcd_set_cursor(0,0);
     lcd_print("Velocidad:");
@@ -159,10 +181,9 @@ void app_main() {
     lcd_print("Angulo:");
 
     while (1) {
-        // Leer teclado si hay dato disponible
+        // Leer teclado
         if (gpio_get_level(DATA_AVAIL) == 0) {
             int key = leer_tecla();
-
             if (key >= 1 && key <= 9) {
                 velocidad = key;
             } else if (key == 0) {
@@ -170,38 +191,46 @@ void app_main() {
             } else {
                 velocidad = 0;
             }
-
-            // Actualizar LCD velocidad y reset angulo
-            lcd_cmd(0x01); // limpiar
+            lcd_cmd(0x01);
             lcd_set_cursor(0,0);
             char buffer[16];
             sprintf(buffer, "Velocidad:%d", velocidad);
             lcd_print(buffer);
 
             lcd_set_cursor(0,1);
-            sprintf(buffer, "Angulo:%.1f", angulo);
+            sprintf(buffer, "E:%.1f H:%.1f", angulo, hall_get_angulo());
             lcd_print(buffer);
 
-            usleep(300000); // anti-rebote
+            usleep(300000);
         }
 
         if (velocidad > 0) {
             motor_step(step_index);
             step_index = (step_index + 1) % 8;
 
-            // Calcular ángulo (28BYJ-48 típico con 4096 pasos por vuelta)
-            angulo += 360.0 / 4096.0;
+            // Actualizar ángulo estimado
+            angulo += 360.0 / pasos_por_vuelta_motor;
             if (angulo >= 360.0) angulo -= 360.0;
 
-            // Actualizar ángulo en LCD (segunda línea)
-            lcd_set_cursor(7,1);
-            char ang_buffer[10];
-            sprintf(ang_buffer, "%.1f ", angulo); // espacio para limpiar caracteres
+            // Auto-calibración con Hall
+            if (hall_detectado) {
+                angulo = 0.0; // Reset a cero cuando pasa por el imán
+                hall_detectado = 0;
+            }
+
+            // Mostrar en LCD
+            lcd_set_cursor(0,1);
+            char ang_buffer[16];
+            sprintf(ang_buffer, "E:%.1f H:%.1f", angulo, hall_get_angulo());
             lcd_print(ang_buffer);
 
-            // Retraso inverso proporcional a la velocidad
+            // Mostrar en terminal
+            printf("Ángulo estimado: %.2f° | Ángulo Hall: %.2f° | Pulsos: %d\n",
+                   angulo, hall_get_angulo(), hall_pulsos);
+
+            // Control velocidad
             int delay_us = 2000 / velocidad;
-            if (delay_us < 1000) delay_us = 1000; // evitar retrasos muy pequeños
+            if (delay_us < 1000) delay_us = 1000;
             usleep(delay_us);
         } else {
             motor_stop();
