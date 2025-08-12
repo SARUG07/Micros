@@ -1,0 +1,77 @@
+#include <stdio.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+
+// ==== CONFIGURACIÓN ====
+#define POT_CHANNEL     ADC_CHANNEL_6       // GPIO34 (ADC1_CH6)
+#define ADC_UNIT        ADC_UNIT_1
+#define ADC_BITWIDTH    ADC_BITWIDTH_12     // 0-4095
+#define ADC_ATTEN       ADC_ATTEN_DB_12     // Hasta ~3.3V
+#define N_SAMPLES       8                   // Promedio de N lecturas
+#define MAX_DEGREES     270.0f
+
+void app_main(void)
+{
+    // --- 1) Inicializar ADC oneshot ---
+    adc_oneshot_unit_handle_t adc_handle;
+    adc_oneshot_unit_init_cfg_t init_cfg = {
+        .unit_id = ADC_UNIT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_cfg, &adc_handle));
+
+    // --- 2) Configurar canal ---
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .bitwidth = ADC_BITWIDTH,
+        .atten = ADC_ATTEN,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT_CHANNEL, &chan_cfg));
+
+    // --- 3) Inicializar calibración (Line Fitting) ---
+    adc_cali_handle_t cali_handle = NULL;
+    bool do_calibration = false;
+
+    adc_cali_line_fitting_config_t cali_cfg = {
+        .unit_id = ADC_UNIT,
+        .atten = ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH,
+    };
+
+    if (adc_cali_create_scheme_line_fitting(&cali_cfg, &cali_handle) == ESP_OK) {
+        do_calibration = true;
+        printf("Calibración Line Fitting habilitada.\n");
+    } else {
+        printf("No se pudo habilitar la calibración, usando fórmula aproximada.\n");
+    }
+
+    // --- 4) Loop de lectura ---
+    while (1) {
+        int sum_raw = 0;
+        for (int i = 0; i < N_SAMPLES; i++) {
+            int raw = 0;
+            ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, POT_CHANNEL, &raw));
+            sum_raw += raw;
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+
+        int avg_raw = sum_raw / N_SAMPLES;
+        int voltage_mv = 0;
+
+        if (do_calibration) {
+            adc_cali_raw_to_voltage(cali_handle, avg_raw, &voltage_mv);
+        } else {
+            // Aproximación lineal
+            voltage_mv = (int)((avg_raw / 4095.0f) * 3300.0f);
+        }
+
+        float voltage_v = voltage_mv / 1000.0f;
+        float degrees = (avg_raw / 4095.0f) * MAX_DEGREES;
+
+        printf("RAW: %4d | Voltaje: %4d mV (%.3f V) | Giro: %.2f°\n",
+               avg_raw, voltage_mv, voltage_v, degrees);
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
